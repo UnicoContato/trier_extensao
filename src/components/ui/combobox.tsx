@@ -203,7 +203,7 @@ export function Combobox({ onProductSelect }: ComboboxProps) {
                     />
                     <div className="flex flex-col w-full overflow-hidden">
                       <span className="truncate font-medium">{product.nome}</span>
-                      <span className="text-xs text-muted-foreground flex gap-3 items-center">
+                      <span className="text-xs text-muted-foreground flex gap-2 items-center">
                         <span>EAN: {product.codigoBarras || '-'}</span>
                         <span>Base: R$ {formatCurrency(basePrice)}</span>
                         {hasDiscount ? (
