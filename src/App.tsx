@@ -3,7 +3,13 @@ import { HashRouter, Routes, Route } from "react-router-dom";
 import { BudgetProvider } from "./context/BudgetContext";
 import { LoginProvider } from "./context/LoginContext";
 import { useLogin } from "./hooks/use-login";
-import { getProducts } from "./services/googleSheetsService";
+import {
+  PRODUCTS_SYNC_STATUS_MESSAGE,
+  PRODUCTS_UPDATED_MESSAGE,
+  type SyncRuntimeEvent,
+  ensureProductsReady,
+} from "./lib/products-sync-runtime";
+import { eventBus } from "./lib/event-bus";
 
 import { Header } from "./components/header";
 import { PrivateRoute } from "./components/private-route";
@@ -20,6 +26,28 @@ function AppContent() {
   const [isSyncing, setIsSyncing] = useState(false);
 
   useEffect(() => {
+    if (typeof chrome === "undefined" || !chrome.runtime?.onMessage) {
+      return;
+    }
+
+    const handleRuntimeMessage = (message: SyncRuntimeEvent) => {
+      if (message.type === PRODUCTS_SYNC_STATUS_MESSAGE) {
+        eventBus.emit("loading:status", message.status);
+      }
+
+      if (message.type === PRODUCTS_UPDATED_MESSAGE) {
+        eventBus.emit("products:updated", message.total);
+      }
+    };
+
+    chrome.runtime.onMessage.addListener(handleRuntimeMessage);
+
+    return () => {
+      chrome.runtime.onMessage.removeListener(handleRuntimeMessage);
+    };
+  }, []);
+
+  useEffect(() => {
     // A lógica só é acionada quando o token existir.
     if (token) {
       // Assim que temos um token, ativamos o estado de sincronização.
@@ -30,7 +58,7 @@ function AppContent() {
         try {
           // O await aqui vai esperar o tempo que for necessário
           // na primeira sincronização.
-          await getProducts();
+          await ensureProductsReady();
         } catch (error) {
           console.error("Falha na sincronização inicial:", error);
           // Adicione um toast de erro se desejar

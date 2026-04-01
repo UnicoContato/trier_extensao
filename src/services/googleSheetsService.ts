@@ -56,6 +56,8 @@ export interface Budget {
   neighborhood?: string;
 }
 
+type NormalizedPaymentMethod = 'pix' | 'credito' | 'debito';
+
 interface ProductApiItem {
   codigo: number | string;
   nome: string;
@@ -84,24 +86,49 @@ interface DiscountCampaignApiItem {
   produtosEncarte?: DiscountFlatApiItem[] | null;
 }
 
+interface CardApiItem {
+  codigoCartao: number | string;
+  nomeCartao?: string | null;
+  modalidadeVenda?: string | null;
+  ativo?: boolean;
+}
+
 type DiscountApiItem = DiscountFlatApiItem | DiscountCampaignApiItem;
 
-const API_BASE_URL =
-  window.location.protocol === 'chrome-extension:'
-    ? 'https://api-sgf-gateway.triersistemas.com.br'
-    : '/api';
+function isExtensionRuntimeAvailable(): boolean {
+  return typeof chrome !== 'undefined' && Boolean(chrome.runtime?.id);
+}
+
+const API_BASE_URL = isExtensionRuntimeAvailable()
+  ? 'https://api-sgf-gateway.triersistemas.com.br'
+  : '/api';
 
 const INTEGRATION_BASE_PATH = '/sgfpod1/rest/integracao';
 const PRODUCT_PAGE_SIZE = 900;
 const DISCOUNT_PAGE_SIZE = 500;
+const CARD_PAGE_SIZE = 100;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const MAX_REQUEST_RETRIES = 2;
 const LAST_SYNC_AT_KEY = 'products:lastSyncAt';
+const PRODUCT_SYNC_AT_KEY = 'products:lastProductsSyncAt';
+const MELHOR_SYNC_AT_KEY = 'products:lastMelhorSyncAt';
+const ENCARTE_SYNC_AT_KEY = 'products:lastEncarteSyncAt';
 const ENCARTE_BLOCKED_UNTIL_KEY = 'products:encarteBlockedUntil';
 const ENCARTE_BACKOFF_MS = 1000 * 60 * 30;
+const PIX_PAYMENT_CODE = 7;
 
 const REVALIDATION_INTERVAL = 1000 * 60 * 10;
 let syncPromise: Promise<ProductInfo[]> | null = null;
+
+interface PaginatedFetchResult<T> {
+  items: T[];
+  isComplete: boolean;
+}
+
+interface SyncFeedResult<T> {
+  data: T;
+  isComplete: boolean;
+}
 
 function getAuthHeaders() {
   return {
@@ -140,6 +167,28 @@ function toSafeNumber(value: unknown, fallback = 0): number {
   const numeric = parseLooseNumber(value);
   if (!Number.isFinite(numeric)) return fallback;
   return numeric;
+}
+
+function normalizeText(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+function normalizePaymentMethod(value: string): NormalizedPaymentMethod {
+  const normalizedValue = normalizeText(value);
+
+  if (normalizedValue === 'pix') return 'pix';
+  if (normalizedValue === 'credito') return 'credito';
+  if (normalizedValue === 'debito') return 'debito';
+
+  throw new Error(`Forma de pagamento nao suportada na integracao: ${value}`);
+}
+
+function normalizeCardMode(value: string | null | undefined): string {
+  return normalizeText(value ?? '').toUpperCase();
 }
 
 function applyBaseDiscount(valorVenda: number, percentualDesconto: number): number {
@@ -379,7 +428,7 @@ async function shouldRunRevalidationNow(): Promise<boolean> {
     return true;
   }
 
-  return Date.now() - lastSyncTimestamp > REVALIDATION_INTERVAL;
+  return Date.now() - lastSyncTimestamp >= REVALIDATION_INTERVAL;
 }
 
 function isTemporaryGatewayFailure(status: number | null): boolean {
@@ -389,6 +438,58 @@ function isTemporaryGatewayFailure(status: number | null): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function getSyncCursor(key: string): Promise<string | null> {
+  const explicitCursor = await getCacheMetadata<string>(key);
+  if (explicitCursor) return explicitCursor;
+
+  return getCacheMetadata<string>(LAST_SYNC_AT_KEY);
+}
+
+async function persistSyncProgress(args: {
+  syncPoint: string;
+  productsComplete?: boolean;
+  melhorComplete?: boolean;
+  encarteComplete?: boolean;
+}): Promise<void> {
+  const writes: Promise<void>[] = [];
+  let hadSuccessfulFeed = false;
+
+  if (args.productsComplete) {
+    writes.push(setCacheMetadata(PRODUCT_SYNC_AT_KEY, args.syncPoint));
+    hadSuccessfulFeed = true;
+  }
+
+  if (args.melhorComplete) {
+    writes.push(setCacheMetadata(MELHOR_SYNC_AT_KEY, args.syncPoint));
+    hadSuccessfulFeed = true;
+  }
+
+  if (args.encarteComplete) {
+    writes.push(setCacheMetadata(ENCARTE_SYNC_AT_KEY, args.syncPoint));
+    hadSuccessfulFeed = true;
+  }
+
+  if (hadSuccessfulFeed) {
+    writes.push(setCacheMetadata(LAST_SYNC_AT_KEY, args.syncPoint));
+  }
+
+  await Promise.all(writes);
+}
+
+function describePendingFeeds(args: {
+  productsComplete: boolean;
+  melhorComplete: boolean;
+  encarteComplete: boolean;
+}): string[] {
+  const pending: string[] = [];
+
+  if (!args.productsComplete) pending.push('produtos');
+  if (!args.melhorComplete) pending.push('melhor preco');
+  if (!args.encarteComplete) pending.push('encarte');
+
+  return pending;
 }
 
 interface FetchPaginatedOptions {
@@ -437,7 +538,7 @@ async function fetchPaginated<T>(
   path: string,
   params: Record<string, unknown>,
   options: FetchPaginatedOptions = {},
-): Promise<T[]> {
+): Promise<PaginatedFetchResult<T>> {
   const pageSize = options.pageSize ?? PRODUCT_PAGE_SIZE;
   const progressLabel = options.progressLabel;
   const allowPartialOnPageError = options.allowPartialOnPageError ?? false;
@@ -445,6 +546,7 @@ async function fetchPaginated<T>(
 
   const allItems: T[] = [];
   let primeiroRegistro = 1;
+  let isComplete = true;
 
   while (true) {
     let page: T[];
@@ -468,6 +570,7 @@ async function fetchPaginated<T>(
           `Falha na paginacao (${path}) na faixa ${primeiroRegistro}. ` +
           `Usando dados parciais ja baixados. Status: ${status ?? 'N/A'}.`,
         );
+        isComplete = false;
         break;
       }
 
@@ -489,15 +592,15 @@ async function fetchPaginated<T>(
     if (page.length < pageSize) break;
   }
 
-  return allItems;
+  return { items: allItems, isComplete };
 }
 
 async function fetchAllProducts(): Promise<ProductApiItem[]> {
-  return fetchPaginated<ProductApiItem>(
+  const result = await fetchPaginated<ProductApiItem>(
     '/produto/obter-v1',
     {
       ativo: true,
-      integracaoEcommerce: false,
+      integracaoEcommerce: true,
       processaCustoMedio: false,
     },
     {
@@ -506,12 +609,14 @@ async function fetchAllProducts(): Promise<ProductApiItem[]> {
       timeoutMs: 45000,
     },
   );
+
+  return result.items;
 }
 
 async function fetchChangedProducts(
   dataInicial: string,
   dataFinal: string,
-): Promise<ProductApiItem[]> {
+): Promise<PaginatedFetchResult<ProductApiItem>> {
   return fetchPaginated<ProductApiItem>(
     '/produto/obter-alterados-v1',
     {
@@ -529,9 +634,10 @@ async function fetchChangedProducts(
 async function fetchChangedProductsSafely(
   dataInicial: string,
   dataFinal: string,
-): Promise<ProductApiItem[]> {
+): Promise<SyncFeedResult<ProductApiItem[]>> {
   try {
-    return await fetchChangedProducts(dataInicial, dataFinal);
+    const result = await fetchChangedProducts(dataInicial, dataFinal);
+    return { data: result.items, isComplete: result.isComplete };
   } catch (error) {
     const status = getAxiosStatusCode(error);
     if (isTemporaryGatewayFailure(status)) {
@@ -540,14 +646,14 @@ async function fetchChangedProductsSafely(
         'Nao foi possivel consultar alteracoes de produtos agora. Mantendo cache atual.',
       );
       console.warn('Falha temporaria no endpoint de produtos alterados.', error);
-      return [];
+      return { data: [], isComplete: false };
     }
 
     throw error;
   }
 }
 
-async function fetchAllMelhorDiscounts(): Promise<DiscountApiItem[]> {
+async function fetchAllMelhorDiscounts(): Promise<PaginatedFetchResult<DiscountApiItem>> {
   return fetchPaginated<DiscountApiItem>(
     '/produto/desconto/melhor/obter-v1',
     {},
@@ -562,7 +668,7 @@ async function fetchAllMelhorDiscounts(): Promise<DiscountApiItem[]> {
 async function fetchChangedMelhorDiscounts(
   dataInicial: string,
   dataFinal: string,
-): Promise<DiscountApiItem[]> {
+): Promise<PaginatedFetchResult<DiscountApiItem>> {
   return fetchPaginated<DiscountApiItem>(
     '/produto/desconto/melhor/obter-alterados-v1',
     {
@@ -577,7 +683,7 @@ async function fetchChangedMelhorDiscounts(
   );
 }
 
-async function fetchAllEncarteDiscounts(): Promise<DiscountApiItem[]> {
+async function fetchAllEncarteDiscounts(): Promise<PaginatedFetchResult<DiscountApiItem>> {
   return fetchPaginated<DiscountApiItem>(
     '/produto/desconto/encarte/obter-v1',
     {},
@@ -589,10 +695,57 @@ async function fetchAllEncarteDiscounts(): Promise<DiscountApiItem[]> {
   );
 }
 
+async function fetchAllCards(): Promise<CardApiItem[]> {
+  const result = await fetchPaginated<CardApiItem>(
+    '/cartao/obter-todos-v1',
+    { ativo: true },
+    {
+      pageSize: CARD_PAGE_SIZE,
+      timeoutMs: 15000,
+    },
+  );
+
+  return result.items;
+}
+
+function pickPreferredCard(
+  cards: CardApiItem[],
+  cardMode: 'CREDITO' | 'DEBITO',
+): CardApiItem | null {
+  const matchingCards = cards.filter(
+    (card) =>
+      card.ativo !== false &&
+      normalizeCardMode(card.modalidadeVenda) === cardMode,
+  );
+
+  if (!matchingCards.length) return null;
+
+  return (
+    matchingCards.find((card) => normalizeText(card.nomeCartao ?? '').includes('padrao')) ??
+    matchingCards[0]
+  );
+}
+
+async function resolveCardCode(cardMode: 'CREDITO' | 'DEBITO'): Promise<number> {
+  const cards = await fetchAllCards();
+  const preferredCard = pickPreferredCard(cards, cardMode);
+
+  if (!preferredCard) {
+    throw new Error(`Nenhum cartao ativo encontrado para a modalidade ${cardMode}.`);
+  }
+
+  const cardCode = toCode(preferredCard.codigoCartao);
+  if (cardCode === null) {
+    throw new Error('Codigo de cartao invalido retornado pela API.');
+  }
+
+  return cardCode;
+}
+
 async function fetchChangedEncarteDiscounts(
   dataInicial: string,
   dataFinal: string,
-): Promise<DiscountApiItem[]> {
+): Promise<PaginatedFetchResult<DiscountApiItem>> {
   return fetchPaginated<DiscountApiItem>(
     '/produto/desconto/encarte/obter-alterados-v1',
     {
@@ -626,70 +779,74 @@ async function blockEncarteTemporarily(): Promise<void> {
 async function fetchMelhorMapSafely(args: {
   dataInicial?: string;
   dataFinal?: string;
-}): Promise<Map<number, number | null>> {
+}): Promise<SyncFeedResult<Map<number, number | null>>> {
+  const isIncremental = Boolean(args.dataInicial && args.dataFinal);
+
   try {
-    const items = args.dataInicial && args.dataFinal
+    const result = args.dataInicial && args.dataFinal
       ? await fetchChangedMelhorDiscounts(args.dataInicial, args.dataFinal)
       : await fetchAllMelhorDiscounts();
 
-    return buildDiscountMap(items);
+    return {
+      data: buildDiscountMap(result.items),
+      isComplete: result.isComplete,
+    };
   } catch (error) {
     const status = getAxiosStatusCode(error);
-    if (isTemporaryGatewayFailure(status)) {
+    if (isIncremental && isTemporaryGatewayFailure(status)) {
       eventBus.emit(
         'loading:status',
         'Melhor preco indisponivel no momento (SGF offline/lento). Usando valor de venda.',
       );
       console.warn('Melhor preco indisponivel temporariamente.', error);
-      return new Map();
+      return { data: new Map(), isComplete: false };
     }
 
-    console.error(
-      'Falha ao buscar descontos de melhor preco. Seguindo com valor de venda.',
-      error,
-    );
-    eventBus.emit(
-      'loading:status',
-      'Melhor preco indisponivel. Usando valor de venda.',
-    );
-    return new Map();
+    throw error;
   }
 }
 
 async function fetchEncarteMapSafely(args: {
   dataInicial?: string;
   dataFinal?: string;
-}): Promise<Map<number, number | null>> {
+}): Promise<SyncFeedResult<Map<number, number | null>>> {
+  const isIncremental = Boolean(args.dataInicial && args.dataFinal);
   const blocked = await isEncarteTemporarilyBlocked();
   if (blocked) {
+    if (!isIncremental) {
+      throw new Error('Encarte bloqueado temporariamente para sincronizacao completa.');
+    }
+
     eventBus.emit(
       'loading:status',
       'Encarte temporariamente indisponivel. Sincronizando com melhor preco e valor de venda.',
     );
-    return new Map();
+    return { data: new Map(), isComplete: false };
   }
 
   try {
-    const items = args.dataInicial && args.dataFinal
+    const result = args.dataInicial && args.dataFinal
       ? await fetchChangedEncarteDiscounts(args.dataInicial, args.dataFinal)
       : await fetchAllEncarteDiscounts();
 
     await deleteCacheMetadata(ENCARTE_BLOCKED_UNTIL_KEY);
-    return buildDiscountMap(items);
+    return {
+      data: buildDiscountMap(result.items),
+      isComplete: result.isComplete,
+    };
   } catch (error) {
     const status = getAxiosStatusCode(error);
-    if (status === 404 || isTemporaryGatewayFailure(status)) {
+    if (isIncremental && (status === 404 || isTemporaryGatewayFailure(status))) {
       await blockEncarteTemporarily();
       eventBus.emit(
         'loading:status',
         'Encarte indisponivel no momento. Usando melhor preco e valor de venda.',
       );
       console.warn('Endpoint de encarte indisponivel. Backoff aplicado.', error);
-      return new Map();
+      return { data: new Map(), isComplete: false };
     }
 
-    console.error('Falha ao buscar descontos de encarte. Seguindo sem encarte.', error);
-    return new Map();
+    throw error;
   }
 }
 
@@ -714,19 +871,33 @@ function mergeFullProducts(
 }
 
 async function runFullSync(): Promise<ProductInfo[]> {
+  const syncPoint = formatDateForTrier();
   eventBus.emit('loading:status', 'Buscando dados completos na API...');
 
   try {
     // Base de produtos primeiro para reduzir concorrencia no SGF/gateway.
     const products = await fetchAllProducts();
-    const melhorMap = await fetchMelhorMapSafely({});
-    const encarteMap = await fetchEncarteMapSafely({});
+    const melhorResult = await fetchMelhorMapSafely({});
+    const encarteResult = await fetchEncarteMapSafely({});
 
-    const mergedProducts = mergeFullProducts(products, melhorMap, encarteMap);
+    if (!melhorResult.isComplete || !encarteResult.isComplete) {
+      throw new Error('Sincronizacao completa parcial detectada. Mantendo cache anterior.');
+    }
+
+    const mergedProducts = mergeFullProducts(
+      products,
+      melhorResult.data,
+      encarteResult.data,
+    );
 
     eventBus.emit('loading:status', 'Atualizando cache local...');
     await saveProductsToCache(mergedProducts);
-    await setCacheMetadata(LAST_SYNC_AT_KEY, formatDateForTrier());
+    await persistSyncProgress({
+      syncPoint,
+      productsComplete: true,
+      melhorComplete: true,
+      encarteComplete: true,
+    });
 
     eventBus.emit('products:updated', mergedProducts.length);
     eventBus.emit('loading:status', 'Sincronizacao completa concluida!');
@@ -752,22 +923,27 @@ async function runFullSync(): Promise<ProductInfo[]> {
 }
 
 async function runIncrementalSync(): Promise<ProductInfo[]> {
-  const dataInicial = await getCacheMetadata<string>(LAST_SYNC_AT_KEY);
-  if (!dataInicial) {
+  const [productsCursor, melhorCursor, encarteCursor] = await Promise.all([
+    getSyncCursor(PRODUCT_SYNC_AT_KEY),
+    getSyncCursor(MELHOR_SYNC_AT_KEY),
+    getSyncCursor(ENCARTE_SYNC_AT_KEY),
+  ]);
+
+  if (!productsCursor || !melhorCursor || !encarteCursor) {
     return runFullSync();
   }
 
   const dataFinal = formatDateForTrier();
   eventBus.emit('loading:status', 'Buscando alteracoes desde a ultima sincronizacao...');
 
-  const [changedProducts, melhorMap, encarteMap] = await Promise.all([
-    fetchChangedProductsSafely(dataInicial, dataFinal),
-    fetchMelhorMapSafely({ dataInicial, dataFinal }),
-    fetchEncarteMapSafely({ dataInicial, dataFinal }),
+  const [changedProductsResult, melhorResult, encarteResult] = await Promise.all([
+    fetchChangedProductsSafely(productsCursor, dataFinal),
+    fetchMelhorMapSafely({ dataInicial: melhorCursor, dataFinal }),
+    fetchEncarteMapSafely({ dataInicial: encarteCursor, dataFinal }),
   ]);
 
   const changedProductMap = new Map<number, ProductApiItem>();
-  changedProducts.forEach((product) => {
+  changedProductsResult.data.forEach((product) => {
     const code = toCode(product.codigo);
     if (code !== null) {
       changedProductMap.set(code, product);
@@ -776,13 +952,29 @@ async function runIncrementalSync(): Promise<ProductInfo[]> {
 
   const affectedCodes = new Set<number>([
     ...changedProductMap.keys(),
-    ...melhorMap.keys(),
-    ...encarteMap.keys(),
+    ...melhorResult.data.keys(),
+    ...encarteResult.data.keys(),
   ]);
 
+  const pendingFeeds = describePendingFeeds({
+    productsComplete: changedProductsResult.isComplete,
+    melhorComplete: melhorResult.isComplete,
+    encarteComplete: encarteResult.isComplete,
+  });
+
   if (!affectedCodes.size) {
-    await setCacheMetadata(LAST_SYNC_AT_KEY, dataFinal);
-    eventBus.emit('loading:status', 'Nenhuma alteracao encontrada.');
+    await persistSyncProgress({
+      syncPoint: dataFinal,
+      productsComplete: changedProductsResult.isComplete,
+      melhorComplete: melhorResult.isComplete,
+      encarteComplete: encarteResult.isComplete,
+    });
+    eventBus.emit(
+      'loading:status',
+      pendingFeeds.length
+        ? `Nenhuma alteracao aplicavel agora. Pendente: ${pendingFeeds.join(', ')}.`
+        : 'Nenhuma alteracao encontrada.',
+    );
     return getProductsFromCache();
   }
 
@@ -808,12 +1000,12 @@ async function runIncrementalSync(): Promise<ProductInfo[]> {
       return;
     }
 
-    const nextMelhor = melhorMap.has(code)
-      ? melhorMap.get(code) ?? null
+    const nextMelhor = melhorResult.data.has(code)
+      ? melhorResult.data.get(code) ?? null
       : currentProduct?.valorMelhor ?? null;
 
-    const nextEncarte = encarteMap.has(code)
-      ? encarteMap.get(code) ?? null
+    const nextEncarte = encarteResult.data.has(code)
+      ? encarteResult.data.get(code) ?? null
       : currentProduct?.valorEncarte ?? null;
 
     productsToUpsert.push(normalizeProduct(baseProduct, nextMelhor, nextEncarte));
@@ -824,13 +1016,20 @@ async function runIncrementalSync(): Promise<ProductInfo[]> {
     removeProductsFromCache(productsToRemove),
   ]);
 
-  await setCacheMetadata(LAST_SYNC_AT_KEY, dataFinal);
+  await persistSyncProgress({
+    syncPoint: dataFinal,
+    productsComplete: changedProductsResult.isComplete,
+    melhorComplete: melhorResult.isComplete,
+    encarteComplete: encarteResult.isComplete,
+  });
 
   const allProducts = await getProductsFromCache();
   eventBus.emit('products:updated', allProducts.length);
   eventBus.emit(
     'loading:status',
-    `Atualizacao incremental concluida (${productsToUpsert.length} atualizados).`,
+    pendingFeeds.length
+      ? `Atualizacao parcial concluida (${productsToUpsert.length} atualizados). Pendente: ${pendingFeeds.join(', ')}.`
+      : `Atualizacao incremental concluida (${productsToUpsert.length} atualizados).`,
   );
 
   return allProducts;
@@ -895,6 +1094,49 @@ function formatDateForTrier(date = new Date()) {
   return `${yyyy}-${MM}-${dd}T${HH}:${mm}:${ss}${sign}${oh}${om}`;
 }
 
+async function buildPaymentPayload(
+  paymentMethod: string,
+  valorTotal: number,
+  numeroPedido: number,
+): Promise<Record<string, unknown>> {
+  const normalizedPaymentMethod = normalizePaymentMethod(paymentMethod);
+  const valor = Number(valorTotal.toFixed(2));
+  const numeroAutorizacao = String(numeroPedido).slice(0, 12);
+
+  // O objeto "pagamento" da API registra o recebimento como dinheiro.
+  // Para preservar Pix/credito/debito, o envio deve usar "pagamentoMultiplo".
+  if (normalizedPaymentMethod === 'pix') {
+    return {
+      pagamentoMultiplo: {
+        pix: {
+          pagamentoRealizado: true,
+          codigo: PIX_PAYMENT_CODE,
+          valor,
+          numeroAutorizacao,
+          idTransacaoPIX: numeroAutorizacao,
+        },
+      },
+    };
+  }
+
+  const cardMode = normalizedPaymentMethod === 'credito' ? 'CREDITO' : 'DEBITO';
+  const cardCode = await resolveCardCode(cardMode);
+
+  return {
+    pagamentoMultiplo: {
+      cartao: [
+        {
+          pagamentoRealizado: true,
+          codigo: cardCode,
+          valor,
+          qtdParcela: 1,
+          numeroAutorizacao: Number(numeroAutorizacao),
+        },
+      ],
+    },
+  };
+}
+
 export async function sendToGoogleSheets(budgetItems: Budget[]) {
   if (!budgetItems.length) {
     console.error('sendToGoogleSheets chamada com array vazio.');
@@ -920,6 +1162,11 @@ export async function sendToGoogleSheets(budgetItems: Budget[]) {
     const subtotal = p.valorUnitario * p.quantidade;
     return total + (subtotal - p.valorDesconto);
   }, 0);
+  const paymentPayload = await buildPaymentPayload(
+    primeiroItem.paymentMethod,
+    valorTotal,
+    numeroPedido,
+  );
 
   const body = {
     numeroPedido,
@@ -956,15 +1203,7 @@ export async function sendToGoogleSheets(budgetItems: Budget[]) {
     },
 
     produtos,
-
-    pagamento: {
-      pagamentoRealizado: true,
-      valorParcela: Number(valorTotal.toFixed(2)),
-      dataVencimento: formatDateForTrier(),
-      valorDinheiro: Number(valorTotal.toFixed(2)),
-      valorTroco: 0,
-      numeroAutorizacao: String(numeroPedido),
-    },
+    ...paymentPayload,
   };
 
   const response = await axios.post(

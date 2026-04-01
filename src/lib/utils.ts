@@ -61,9 +61,10 @@ export function formatBudgetMessage(
     message += `Quantidade: ${item.quantity}\n`;
     message += `Preço Unitário: R$ ${item.price.toFixed(2)}\n`;
 
-    const descontoValor = item.price * (item.discount / 100);
-
-    message += `Desconto: ${item.discount}% (R$ ${descontoValor.toFixed(2)})\n`;
+    if (item.discount > 0) {
+      const descontoValor = item.price * (item.discount / 100);
+      message += `Desconto: ${item.discount}% (R$ ${descontoValor.toFixed(2)})\n`;
+    }
     message += `Subtotal: R$ ${item.total.toFixed(2)}\n`;
 
     totalGeral += item.total;
